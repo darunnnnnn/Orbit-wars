@@ -16,6 +16,20 @@ SAFETY_MARGIN = 1.20
 OBS_WINDOW = 50
 FFA_GARRISON_FACTOR = 15  # higher buffer in 4p — more threats
 
+# Fleet size scaling — minimum ships to send per phase
+# Forces larger fleets as game progresses, never caps like Vadasz
+def min_fleet_size(turn):
+    if turn < 50:   return 15
+    if turn < 150:  return 30
+    if turn < 300:  return 60
+    return 120
+
+# Max ships to sit on any planet — anything above this gets sent
+def garrison_cap(turn, prod, garrison_factor):
+    base = prod * garrison_factor
+    # Never sit on more than 150 ships regardless of production
+    return min(base, 150)
+
 
 class Agent:
     def __init__(self):
@@ -26,6 +40,7 @@ class Agent:
         self._opponent_type = "D"
         self._num_players = 2        # detected on first turn
         self._primary_target = None  # in 4p: the one enemy we focus on
+        self._idle_turns = 0         # track consecutive idle turns
 
     # ------------------------------------------------------------------
     # ENTRY POINT — called by Kaggle as agent(obs)
@@ -94,8 +109,19 @@ class Agent:
             actions.append(attack)
 
         # Phase 7 — flow rear ships to frontline
-        flow = self._flow_rear_to_front(planets, my_id, turn, av, threats, garrison_factor)
+        flow = self._flow_rear_to_front(planets, my_id, turn, av, threats, garrison_factor, cur_turn=turn)
         actions.extend(flow)
+
+        # Anti-idle: if nothing launched yet and we own planets with excess ships, force send
+        if not actions:
+            self._idle_turns += 1
+            if self._idle_turns >= 3:
+                force = self._force_send(planets, my_id, turn, garrison_factor)
+                if force:
+                    actions.append(force)
+                    self._idle_turns = 0
+        else:
+            self._idle_turns = 0
 
         return actions
 
@@ -216,8 +242,8 @@ class Agent:
             if src_id in targeted:
                 continue
             sx, sy = self._pos(src, turn)
-            min_garrison = src[P_PROD] * garrison_factor
-            available = src[P_SHIPS] - min_garrison
+            cap = garrison_cap(turn, src[P_PROD], garrison_factor)
+            available = src[P_SHIPS] - cap
             if available <= 0:
                 continue
 
@@ -230,7 +256,10 @@ class Agent:
                 eta = travel_time(d, available)
                 prod_gain = tgt[P_PROD] * eta if tgt[P_OWNER] != NEUTRAL else 0
                 garrison_at_arrival = tgt[P_SHIPS] + prod_gain
-                needed = math.ceil(garrison_at_arrival * SAFETY_MARGIN) + 1
+                needed = max(
+                    math.ceil(garrison_at_arrival * SAFETY_MARGIN) + 1,
+                    min_fleet_size(turn)  # never send a tiny fleet
+                )
                 if available < needed:
                     continue
 
@@ -259,6 +288,34 @@ class Agent:
                     targeted.add(tgt[P_ID])
 
         return best_action
+
+    # ------------------------------------------------------------------
+    # ANTI-IDLE FORCE SEND — fires when bot has been idle 3+ turns
+    # ------------------------------------------------------------------
+    def _force_send(self, planets, my_id, turn, garrison_factor):
+        """Pick the planet with most excess ships and send them at the best target."""
+        my_planets = [p for p in planets.values() if p[P_OWNER] == my_id]
+        if not my_planets:
+            return None
+        # Find planet with most ships above cap
+        src = max(my_planets, key=lambda p: p[P_SHIPS] - garrison_cap(turn, p[P_PROD], garrison_factor))
+        cap = garrison_cap(turn, src[P_PROD], garrison_factor)
+        available = src[P_SHIPS] - cap
+        if available <= 5:
+            return None
+        sx, sy = self._pos(src, turn)
+        # Pick closest non-owned planet regardless of garrison
+        candidates = [p for p in planets.values() if p[P_OWNER] != my_id]
+        if not candidates:
+            return None
+        tgt = min(candidates, key=lambda p: dist2(sx, sy, *self._pos(p, turn)))
+        tx, ty = self._predict(tgt, sx, sy, available, turn)
+        if path_hits_sun(sx, sy, tx, ty):
+            return None
+        send = min(available, tgt[P_SHIPS] + min_fleet_size(turn))
+        if send <= 0:
+            return None
+        return [src[P_ID], angle_to(sx, sy, tx, ty), send]
 
     # ------------------------------------------------------------------
     # PHASE 6 — COMET INTERCEPTION
@@ -295,7 +352,7 @@ class Agent:
     # ------------------------------------------------------------------
     # PHASE 7 — REAR TO FRONT FLOW
     # ------------------------------------------------------------------
-    def _flow_rear_to_front(self, planets, my_id, turn, av, threats, garrison_factor=MIN_GARRISON_FACTOR):
+    def _flow_rear_to_front(self, planets, my_id, turn, av, threats, garrison_factor=MIN_GARRISON_FACTOR, cur_turn=0):
         actions = []
         my_planets = {pid: p for pid, p in planets.items() if p[P_OWNER] == my_id}
         if len(my_planets) < 2:
@@ -316,7 +373,8 @@ class Agent:
         for pid, p in sorted_p[1:]:
             if pid in threats:
                 continue
-            excess = p[P_SHIPS] - p[P_PROD] * max(REAR_MAX_FACTOR, garrison_factor * 2)
+            # Use garrison_cap so rear planets also respect the 150-ship rule
+            excess = p[P_SHIPS] - garrison_cap(cur_turn, p[P_PROD], max(REAR_MAX_FACTOR, garrison_factor * 2))
             if excess <= 5:
                 continue
             sx, sy = self._pos(p, turn)
