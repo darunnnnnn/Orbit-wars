@@ -4,31 +4,25 @@ from utils import (
     planet_pos, predict_pos, angle_to, path_hits_sun, comet_future_pos
 )
 
-# Planet list indices
 P_ID, P_OWNER, P_X, P_Y, P_RADIUS, P_SHIPS, P_PROD = 0, 1, 2, 3, 4, 5, 6
-# Fleet list indices
 F_ID, F_OWNER, F_X, F_Y, F_ANGLE, F_FROM, F_SHIPS = 0, 1, 2, 3, 4, 5, 6
 
 NEUTRAL = -1
-MIN_GARRISON_FACTOR = 10
-REAR_MAX_FACTOR = 20
-SAFETY_MARGIN = 1.20
-OBS_WINDOW = 50
+# Keep only this many ships on a planet as buffer — very low so we always attack
+BUFFER = 5
+# How much extra to send on top of garrison to guarantee capture
+OVERKILL = 5
 
 
 class Agent:
     def __init__(self):
         self._turn = 0
-        self._initial_planets = {}   # id -> planet list from initial_planets
+        self._initial_planets = {}
         self._angular_velocity = 0.0
-        self._history = []
-        self._opponent_type = "D"
+        # track which planets we already sent a fleet to this turn
+        self._in_transit_targets = set()
 
-    # ------------------------------------------------------------------
-    # ENTRY POINT — called by Kaggle as agent(obs)
-    # ------------------------------------------------------------------
     def __call__(self, obs):
-        # Bootstrap initial state once
         if self._turn == 0:
             self._angular_velocity = obs.get("angular_velocity", 0.0)
             for p in obs.get("initial_planets", []):
@@ -38,85 +32,93 @@ class Agent:
         self._turn += 1
 
         my_id = obs.get("player", 0)
-        raw_planets = obs.get("planets", [])
-        raw_fleets = obs.get("fleets", [])
+        planets = {p[P_ID]: p for p in obs.get("planets", [])}
+        fleets = obs.get("fleets", [])
         comet_ids = set(obs.get("comet_planet_ids", []))
         comet_groups = obs.get("comets", [])
 
-        planets = {p[P_ID]: p for p in raw_planets}
-        av = self._angular_velocity
+        # Update in-transit targets from our own fleets
+        self._in_transit_targets = set()
+        for f in fleets:
+            if f[F_OWNER] == my_id:
+                self._in_transit_targets.add(f[F_FROM])  # source already launched
 
-        targeted = set()
+        # Incoming threats: planet_id -> total incoming enemy ships
+        threats = self._incoming_threats(planets, fleets, my_id, turn)
+
         actions = []
+        used_sources = set()  # planets we already launched from this turn
 
-        # Phase 2 — threat detection
-        threats = self._detect_threats(planets, raw_fleets, my_id, turn, av)
-
-        # Phase 3 — classify opponent
-        self._update_history(planets, my_id)
-        if turn > 0 and turn % OBS_WINDOW == 0:
-            self._classify_opponent()
-
-        # Defend critical threats
+        # --- STEP 1: Emergency defense — reinforce planets about to fall ---
         for pid, incoming in threats.items():
             p = planets[pid]
-            needed = incoming - p[P_SHIPS]
-            if needed > 0:
-                action = self._find_reinforcement(planets, pid, needed, my_id, turn, av)
-                if action:
-                    actions.append(action)
+            px, py = self._pos(p, turn)
+            shortfall = incoming - p[P_SHIPS]
+            if shortfall <= 0:
+                continue
+            helper = self._best_reinforcer(planets, pid, shortfall + BUFFER, my_id, turn, used_sources)
+            if helper:
+                actions.append(helper)
+                used_sources.add(helper[0])
 
-        # Phase 6 — comet interception
-        comet_action = self._comet_intercept(planets, comet_ids, comet_groups, my_id, turn, av)
-        if comet_action:
-            actions.append(comet_action)
-            targeted.add(comet_action[0])  # mark source used
+        # --- STEP 2: Attack from EVERY owned planet that has ships to spare ---
+        my_planets = [p for p in planets.values() if p[P_OWNER] == my_id]
+        targets_taken = set()  # don't send two fleets to same target this turn
 
-        # Phase 4+5 — best attack
-        attack = self._best_attack(planets, my_id, turn, av, comet_ids, targeted)
-        if attack:
-            actions.append(attack)
+        # Sort my planets: most ships first so strongest planets attack first
+        for src in sorted(my_planets, key=lambda p: -p[P_SHIPS]):
+            if src[P_ID] in used_sources:
+                continue
+            sx, sy = self._pos(src, turn)
+            available = src[P_SHIPS] - BUFFER
+            if available <= 1:
+                continue
 
-        # Phase 7 — flow rear ships to frontline
-        flow = self._flow_rear_to_front(planets, my_id, turn, av, threats)
-        actions.extend(flow)
+            best = self._pick_target(planets, src, sx, sy, available, my_id,
+                                     turn, comet_ids, targets_taken, threats)
+            if best is None:
+                continue
+
+            tgt, tx, ty, send = best
+            actions.append([src[P_ID], angle_to(sx, sy, tx, ty), send])
+            targets_taken.add(tgt[P_ID])
+            used_sources.add(src[P_ID])
+
+        # --- STEP 3: Grab comets with tiny fleets ---
+        comet_actions = self._grab_comets(planets, comet_ids, comet_groups,
+                                          my_id, turn, used_sources)
+        actions.extend(comet_actions)
 
         return actions
 
     # ------------------------------------------------------------------
-    # HELPERS — position
+    # POSITION HELPERS
     # ------------------------------------------------------------------
     def _pos(self, p, turn):
         ip = self._initial_planets.get(p[P_ID], p)
         return planet_pos(p, ip, self._angular_velocity, turn)
 
-    def _predict(self, p, src_x, src_y, ships, turn):
+    def _predict(self, p, sx, sy, ships, turn):
         ip = self._initial_planets.get(p[P_ID], p)
-        return predict_pos(p, ip, self._angular_velocity, turn, ships, src_x, src_y)
+        return predict_pos(p, ip, self._angular_velocity, turn, ships, sx, sy)
 
     # ------------------------------------------------------------------
-    # PHASE 2 — THREAT DETECTION
+    # THREAT DETECTION
     # ------------------------------------------------------------------
-    def _detect_threats(self, planets, fleets, my_id, turn, av):
+    def _incoming_threats(self, planets, fleets, my_id, turn):
         threats = {}
         my_pids = {pid for pid, p in planets.items() if p[P_OWNER] == my_id}
         for f in fleets:
             if f[F_OWNER] == my_id:
                 continue
-            target = self._fleet_target(f, planets, turn)
+            # figure out which planet this fleet is heading to
+            target = self._guess_target(f, planets, turn)
             if target not in my_pids:
                 continue
-            tgt_p = planets[target]
-            d = dist2(f[F_X], f[F_Y], *self._pos(tgt_p, turn))
-            eta = travel_time(d, f[F_SHIPS])
-            if eta > 20:
-                continue
-            garrison = tgt_p[P_SHIPS] + tgt_p[P_PROD] * eta
-            if f[F_SHIPS] > garrison:
-                threats[target] = threats.get(target, 0) + f[F_SHIPS]
+            threats[target] = threats.get(target, 0) + f[F_SHIPS]
         return threats
 
-    def _fleet_target(self, fleet, planets, turn):
+    def _guess_target(self, fleet, planets, turn):
         fx, fy, fa = fleet[F_X], fleet[F_Y], fleet[F_ANGLE]
         best, best_diff = None, math.pi
         for pid, p in planets.items():
@@ -125,161 +127,71 @@ class Agent:
             diff = abs((a - fa + math.pi) % (2 * math.pi) - math.pi)
             if diff < best_diff:
                 best_diff, best = diff, pid
-        return best if best_diff < 0.3 else None
+        return best if best_diff < 0.25 else None
 
     # ------------------------------------------------------------------
-    # PHASE 3 — OPPONENT CLASSIFICATION
+    # TARGET SELECTION — called per source planet
     # ------------------------------------------------------------------
-    def _update_history(self, planets, my_id):
-        my_s = sum(p[P_SHIPS] for p in planets.values() if p[P_OWNER] == my_id)
-        en_s = sum(p[P_SHIPS] for p in planets.values() if p[P_OWNER] not in (my_id, NEUTRAL))
-        my_pr = sum(p[P_PROD] for p in planets.values() if p[P_OWNER] == my_id)
-        en_pr = sum(p[P_PROD] for p in planets.values() if p[P_OWNER] not in (my_id, NEUTRAL))
-        self._history.append((my_s, en_s, my_pr, en_pr))
+    def _pick_target(self, planets, src, sx, sy, available,
+                     my_id, turn, comet_ids, taken, threats):
+        best_score = -1e9
+        best = None
 
-    def _classify_opponent(self):
-        if len(self._history) < 10:
-            return
-        recent = self._history[-OBS_WINDOW:]
-        en_ships = [h[1] for h in recent]
-        drops = sum(1 for i in range(1, len(en_ships)) if en_ships[i] < en_ships[i-1] * 0.7)
-        en_prod_growth = recent[-1][3] - recent[0][3]
-        if drops >= 3:
-            self._opponent_type = "B"
-        elif en_prod_growth >= 8:
-            self._opponent_type = "A"
-        elif recent[-1][1] > recent[0][1] * 1.5 and en_prod_growth < 3:
-            self._opponent_type = "C"
-        else:
-            self._opponent_type = "D"
-
-    # ------------------------------------------------------------------
-    # PHASE 4+5 — ATTACK
-    # ------------------------------------------------------------------
-    def _best_attack(self, planets, my_id, turn, av, comet_ids, targeted):
-        my_planets = [(pid, p) for pid, p in planets.items() if p[P_OWNER] == my_id]
-        candidates = [p for p in planets.values()
-                      if p[P_OWNER] != my_id and p[P_ID] not in targeted]
-
-        best_action, best_score = None, -1e9
-
-        for src_id, src in my_planets:
-            if src_id in targeted:
+        for tgt in planets.values():
+            if tgt[P_OWNER] == my_id:
                 continue
-            sx, sy = self._pos(src, turn)
-            min_garrison = src[P_PROD] * MIN_GARRISON_FACTOR
-            available = src[P_SHIPS] - min_garrison
-            if available <= 0:
+            if tgt[P_ID] in taken:
+                continue
+            # skip comets in main attack loop — handled separately
+            if tgt[P_ID] in comet_ids:
                 continue
 
-            for tgt in candidates:
-                tx, ty = self._predict(tgt, sx, sy, available, turn)
-                if path_hits_sun(sx, sy, tx, ty):
+            tx, ty = self._predict(tgt, sx, sy, available, turn)
+            if path_hits_sun(sx, sy, tx, ty):
+                continue
+
+            d = dist2(sx, sy, tx, ty)
+            eta = travel_time(d, available)
+
+            # garrison at arrival: neutral stays flat, enemy grows
+            extra = tgt[P_PROD] * eta if tgt[P_OWNER] != NEUTRAL else 0
+            garrison = tgt[P_SHIPS] + extra
+            send = garrison + OVERKILL
+
+            if send > available:
+                # can't afford full overkill — try with everything we have
+                # only skip if we'd lose
+                if available <= garrison:
                     continue
+                send = available
 
-                d = dist2(sx, sy, tx, ty)
-                eta = travel_time(d, available)
-                # Neutral doesn't produce, enemy does
-                prod_gain = tgt[P_PROD] * eta if tgt[P_OWNER] != NEUTRAL else 0
-                garrison_at_arrival = tgt[P_SHIPS] + prod_gain
-                needed = math.ceil(garrison_at_arrival * SAFETY_MARGIN) + 1
-                if available < needed:
-                    continue
+            # Score: production value is king, penalise distance and cost
+            score = tgt[P_PROD] * 200 - d * 1.5 - garrison * 2
+            # Bonus for attacking enemy (not neutral) — denies their production
+            if tgt[P_OWNER] != NEUTRAL:
+                score += 100
+            # Bonus for planets already under our fleet pressure
+            if tgt[P_ID] in self._in_transit_targets:
+                score -= 500  # don't double-send
 
-                score = tgt[P_PROD] * 100 - d * 2 - tgt[P_SHIPS] * 3
-                if tgt[P_ID] in comet_ids:
-                    score -= 50  # prefer stable planets over comets in main attack
+            if score > best_score:
+                best_score = score
+                best = (tgt, tx, ty, send)
 
-                if self._opponent_type == "C":
-                    score += tgt[P_PROD] * 50
-                elif self._opponent_type == "B" and tgt[P_OWNER] == my_id:
-                    continue
-
-                if score > best_score:
-                    best_score = score
-                    best_action = [src_id, angle_to(sx, sy, tx, ty), needed]
-                    targeted.add(tgt[P_ID])
-
-        return best_action
+        return best
 
     # ------------------------------------------------------------------
-    # PHASE 6 — COMET INTERCEPTION
+    # EMERGENCY REINFORCEMENT
     # ------------------------------------------------------------------
-    def _comet_intercept(self, planets, comet_ids, comet_groups, my_id, turn, av):
-        if not comet_ids:
-            return None
-        my_planets = [(pid, p) for pid, p in planets.items() if p[P_OWNER] == my_id]
-
-        for group in comet_groups:
-            for cid in group.get("planet_ids", []):
-                if cid not in planets:
-                    continue
-                comet = planets[cid]
-                # Use path to find where comet will be in ~5 turns
-                future = comet_future_pos(group, cid, 5)
-                if future is None:
-                    cx, cy = comet[P_X], comet[P_Y]
-                else:
-                    cx, cy = future
-
-                # Find closest owned planet with spare ships
-                for src_id, src in sorted(my_planets,
-                        key=lambda x: dist2(*self._pos(x[1], turn), cx, cy)):
-                    sx, sy = self._pos(src, turn)
-                    send = min(10, src[P_SHIPS] - src[P_PROD] * MIN_GARRISON_FACTOR)
-                    if send <= 0:
-                        continue
-                    if path_hits_sun(sx, sy, cx, cy):
-                        continue
-                    return [src_id, angle_to(sx, sy, cx, cy), send]
-        return None
-
-    # ------------------------------------------------------------------
-    # PHASE 7 — REAR TO FRONT FLOW
-    # ------------------------------------------------------------------
-    def _flow_rear_to_front(self, planets, my_id, turn, av, threats):
-        actions = []
-        my_planets = {pid: p for pid, p in planets.items() if p[P_OWNER] == my_id}
-        if len(my_planets) < 2:
-            return actions
-
-        enemy_pos = [(p[P_X], p[P_Y]) for p in planets.values()
-                     if p[P_OWNER] not in (my_id, NEUTRAL)]
-        if not enemy_pos:
-            return actions
-
-        def min_en_dist(pos):
-            return min(dist2(pos[0], pos[1], ex, ey) for ex, ey in enemy_pos)
-
-        sorted_p = sorted(my_planets.items(),
-                          key=lambda x: min_en_dist(self._pos(x[1], turn)))
-        front_pos = self._pos(sorted_p[0][1], turn)
-
-        for pid, p in sorted_p[1:]:
-            if pid in threats:
-                continue
-            excess = p[P_SHIPS] - p[P_PROD] * REAR_MAX_FACTOR
-            if excess <= 5:
-                continue
-            sx, sy = self._pos(p, turn)
-            if path_hits_sun(sx, sy, front_pos[0], front_pos[1]):
-                continue
-            actions.append([pid, angle_to(sx, sy, front_pos[0], front_pos[1]), excess])
-
-        return actions
-
-    # ------------------------------------------------------------------
-    # REINFORCEMENT
-    # ------------------------------------------------------------------
-    def _find_reinforcement(self, planets, target_id, needed, my_id, turn, av):
+    def _best_reinforcer(self, planets, target_id, needed, my_id, turn, used):
         tgt = planets[target_id]
         tx, ty = self._pos(tgt, turn)
         best, best_d = None, 1e9
         for pid, p in planets.items():
-            if p[P_OWNER] != my_id or pid == target_id:
+            if p[P_OWNER] != my_id or pid == target_id or pid in used:
                 continue
-            available = p[P_SHIPS] - p[P_PROD] * MIN_GARRISON_FACTOR
-            if available < needed:
+            avail = p[P_SHIPS] - BUFFER
+            if avail < needed:
                 continue
             sx, sy = self._pos(p, turn)
             d = dist2(sx, sy, tx, ty)
@@ -288,8 +200,41 @@ class Agent:
                 best = [pid, angle_to(sx, sy, tx, ty), needed]
         return best
 
+    # ------------------------------------------------------------------
+    # COMET GRABBING
+    # ------------------------------------------------------------------
+    def _grab_comets(self, planets, comet_ids, comet_groups, my_id, turn, used):
+        actions = []
+        my_planets = [p for p in planets.values() if p[P_OWNER] == my_id]
 
-# Kaggle calls agent(obs) — module-level function
+        for group in comet_groups:
+            for cid in group.get("planet_ids", []):
+                if cid not in planets:
+                    continue
+                comet = planets[cid]
+                if comet[P_OWNER] == my_id:
+                    continue  # already ours
+
+                future = comet_future_pos(group, cid, 3)
+                cx, cy = future if future else (comet[P_X], comet[P_Y])
+
+                for src in sorted(my_planets, key=lambda p: dist2(*self._pos(p, turn), cx, cy)):
+                    if src[P_ID] in used:
+                        continue
+                    sx, sy = self._pos(src, turn)
+                    send = comet[P_SHIPS] + OVERKILL
+                    avail = src[P_SHIPS] - BUFFER
+                    if avail < send:
+                        continue
+                    if path_hits_sun(sx, sy, cx, cy):
+                        continue
+                    actions.append([src[P_ID], angle_to(sx, sy, cx, cy), send])
+                    used.add(src[P_ID])
+                    break
+
+        return actions
+
+
 _agent = Agent()
 
 def agent(obs):
