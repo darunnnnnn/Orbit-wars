@@ -16,18 +16,18 @@ SAFETY_MARGIN = 1.20
 OBS_WINDOW = 50
 FFA_GARRISON_FACTOR = 15  # higher buffer in 4p — more threats
 
-# Fleet size scaling — minimum ships to send per phase
-# Forces larger fleets as game progresses, never caps like Vadasz
+# Fleet size scaling based on replay analysis of top bot
+# Early game: precise small fleets (15-25), mid: scale up, late: dump everything
 def min_fleet_size(turn):
+    if turn < 15:   return 0    # pure observation window like top bot
     if turn < 50:   return 15
-    if turn < 150:  return 30
-    if turn < 300:  return 60
-    return 120
+    if turn < 150:  return 35
+    if turn < 300:  return 70
+    return 130
 
 # Max ships to sit on any planet — anything above this gets sent
 def garrison_cap(turn, prod, garrison_factor):
     base = prod * garrison_factor
-    # Never sit on more than 150 ships regardless of production
     return min(base, 150)
 
 
@@ -102,6 +102,10 @@ class Agent:
             actions.append(comet_action)
             targeted.add(comet_action[0])  # mark source used
 
+        # Pure observation window turns 0-11 (matches top bot behaviour)
+        if turn < 12:
+            return []
+
         # Phase 4+5 — best attack
         attack = self._best_attack(planets, my_id, turn, av, comet_ids, targeted,
                                    garrison_factor, self._primary_target if is_ffa else None)
@@ -112,8 +116,9 @@ class Agent:
         flow = self._flow_rear_to_front(planets, my_id, turn, av, threats, garrison_factor, cur_turn=turn)
         actions.extend(flow)
 
-        # Anti-idle: if nothing launched yet and we own planets with excess ships, force send
-        if not actions:
+        # Anti-idle: if nothing launched and we have excess ships, force send
+        # Only kicks in after turn 15 so we don't waste early ships
+        if not actions and turn >= 15:
             self._idle_turns += 1
             if self._idle_turns >= 3:
                 force = self._force_send(planets, my_id, turn, garrison_factor)
@@ -256,10 +261,11 @@ class Agent:
                 eta = travel_time(d, available)
                 prod_gain = tgt[P_PROD] * eta if tgt[P_OWNER] != NEUTRAL else 0
                 garrison_at_arrival = tgt[P_SHIPS] + prod_gain
-                needed = max(
-                    math.ceil(garrison_at_arrival * SAFETY_MARGIN) + 1,
-                    min_fleet_size(turn)  # never send a tiny fleet
-                )
+                # Precise sizing like top bot: garrison + small buffer, scaled by turn
+                needed = math.ceil(garrison_at_arrival * SAFETY_MARGIN) + 1
+                mfs = min_fleet_size(turn)
+                if needed < mfs:
+                    needed = mfs
                 if available < needed:
                     continue
 
