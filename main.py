@@ -16,14 +16,15 @@ SAFETY_MARGIN = 1.20
 OBS_WINDOW = 50
 FFA_GARRISON_FACTOR = 15  # higher buffer in 4p — more threats
 
-# Fleet size scaling based on replay analysis of top bot
-# Early game: precise small fleets (15-25), mid: scale up, late: dump everything
+# Fleet size scaling from replay analysis of bowwowforeach across 38 games
+# turns 0-20: avg=17, 21-50: avg=31, 51-100: avg=43, 101-200: avg=73, 201-300: avg=86, 301+: avg=126
 def min_fleet_size(turn):
-    if turn < 15:   return 0    # pure observation window like top bot
-    if turn < 50:   return 15
-    if turn < 150:  return 35
-    if turn < 300:  return 70
-    return 130
+    if turn <= 20:  return 17
+    if turn <= 50:  return 31
+    if turn <= 100: return 43
+    if turn <= 200: return 73
+    if turn <= 300: return 86
+    return 126
 
 # Max ships to sit on any planet — anything above this gets sent
 def garrison_cap(turn, prod, garrison_factor):
@@ -102,8 +103,9 @@ class Agent:
             actions.append(comet_action)
             targeted.add(comet_action[0])  # mark source used
 
-        # Pure observation window turns 0-11 (matches top bot behaviour)
-        if turn < 12:
+        # Top bot first moves between turns 1-12, most common turn 4
+        # No hard block — let it act from turn 1 if it has a good target
+        if turn < 1:
             return []
 
         # Phase 4+5 — best attack
@@ -116,11 +118,10 @@ class Agent:
         flow = self._flow_rear_to_front(planets, my_id, turn, av, threats, garrison_factor, cur_turn=turn)
         actions.extend(flow)
 
-        # Anti-idle: if nothing launched and we have excess ships, force send
-        # Only kicks in after turn 15 so we don't waste early ships
-        if not actions and turn >= 15:
+        # Anti-idle: avg idle streak is 14 turns, max 81 — allow some idle but not too much
+        if not actions and turn >= 4:
             self._idle_turns += 1
-            if self._idle_turns >= 3:
+            if self._idle_turns >= 5:
                 force = self._force_send(planets, my_id, turn, garrison_factor)
                 if force:
                     actions.append(force)
